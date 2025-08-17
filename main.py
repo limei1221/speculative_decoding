@@ -29,7 +29,7 @@ class SpeculativeDecoder:
         self.tokenizer = tokenizer
         self.config = config
 
-        self.device = "gpu" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
+        self.device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
         self.target_model = self.target_model.to(self.device)
         self.draft_model = self.draft_model.to(self.device)
 
@@ -63,22 +63,27 @@ class SpeculativeDecoder:
 
         return tokens, probs
 
-    def _generate_draft_tokens(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> Tuple[
+    def _generate_draft_tokens(self, input_ids: torch.Tensor, attention_mask: torch.Tensor, gamma: int) -> Tuple[
         torch.Tensor, torch.Tensor]:
         """Generate draft tokens using the draft model."""
         with torch.no_grad():
             draft_outputs = self.draft_model.generate(
                 input_ids,
                 attention_mask=attention_mask,
-                max_new_tokens=self.config.gamma,
+                max_new_tokens=gamma,
                 do_sample=self.config.do_sample,
                 temperature=self.config.temperature,
+                pad_token_id=self.tokenizer.eos_token_id,
+                eos_token_id=self.tokenizer.eos_token_id,
                 return_dict_in_generate=True,
                 output_scores=True,
             )
 
             draft_tokens = draft_outputs.sequences[:, input_ids.size(1):]  # torch.Size([1, 5])
-            draft_probs = torch.stack(draft_outputs.scores).softmax(-1).squeeze(1)  # torch.Size([5, 151936])
+            if self.config.temperature > 0.0:
+                draft_probs = (torch.stack(draft_outputs.scores) / self.config.temperature).softmax(-1).squeeze(1)
+            else:
+                draft_probs = torch.stack(draft_outputs.scores).softmax(-1).squeeze(1)  # torch.Size([5, 151936])
 
             return draft_tokens, draft_probs
 
@@ -138,7 +143,6 @@ class SpeculativeDecoder:
         input_ids = inputs.input_ids
         attention_mask = inputs.attention_mask
 
-        input_len = input_ids.size(1)
         generated_tokens = []
 
         total_proposed = 0
@@ -152,7 +156,7 @@ class SpeculativeDecoder:
             if self.config.verbose:
                 print(f"Iteration {iterations}: Current length {len(generated_tokens)}, Gamma: {current_gamma}")
 
-            draft_tokens, draft_probs = self._generate_draft_tokens(input_ids, attention_mask)
+            draft_tokens, draft_probs = self._generate_draft_tokens(input_ids, attention_mask, current_gamma)
 
             accepted_tokens, num_accepted = self._verify_draft_tokens(
                 input_ids, attention_mask, draft_tokens, draft_probs
@@ -198,7 +202,7 @@ class SpeculativeDecoder:
 
 def greedy_decode(model, tokenizer, prompt: str, max_new_tokens: int = 128) -> str:
     """Simple greedy decoding for comparison."""
-    device = "gpu" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
+    device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
     model.eval()
 
     inputs = tokenizer(prompt, return_tensors="pt").to(device)
@@ -210,47 +214,12 @@ def greedy_decode(model, tokenizer, prompt: str, max_new_tokens: int = 128) -> s
             max_new_tokens=max_new_tokens,
             do_sample=False,
             pad_token_id=tokenizer.eos_token_id,
-            eos_token_id=tokenizer.eos_token_id
+            eos_token_id=tokenizer.eos_token_id,
         )
 
     input_len = inputs.input_ids.size(1)
     completion = tokenizer.decode(outputs[0][input_len:], skip_special_tokens=True)
     return completion
-
-
-def benchmark_decoding(target_model, draft_model, tokenizer, prompt: str, config: SpeculativeConfig):
-    """Benchmark different decoding strategies."""
-    print("===BENCHMARKING DECODING STRATEGIES===")
-
-    gamma_values = [3, 5, 7, 10]
-    results = {}
-
-    for gamma in gamma_values:
-        print(f"\nTesting with gamma = {gamma}")
-        config.gamma = gamma
-        config.early_stop = False
-
-        decoder = SpeculativeDecoder(target_model, draft_model, tokenizer, config)
-
-        start_time = time.time()
-        output, metrics = decoder.decode(prompt)
-        end_time = time.time()
-
-        results[gamma] = {
-            'time': end_time - start_time,
-            'output_length': len(output),
-            'acceptance_ratio': metrics['acceptance_ratio'],
-            'efficiency': metrics['efficiency']
-        }
-
-        print(f"  Time: {end_time - start_time:.3f}s")
-        print(f"  Acceptance ratio: {metrics['acceptance_ratio']:.3f}")
-        print(f"  Efficiency: {metrics['efficiency']:.3f}")
-
-    optimal_gamma = max(results.keys(), key=lambda g: results[g]['efficiency'])
-    print(f"\nOptimal gamma: {optimal_gamma}")
-
-    return results, optimal_gamma
 
 
 if __name__ == "__main__":
@@ -264,7 +233,7 @@ if __name__ == "__main__":
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     draft_tokenizer = AutoTokenizer.from_pretrained(draft_model_name)
 
-    assert tokenizer.vocab_size == draft_tokenizer.vocab_size, "Vocabulary sizes must match"
+    assert tokenizer.get_vocab() == draft_tokenizer.get_vocab(), "Vocabulary must match"
     print(f"Models loaded successfully. Vocabulary size: {tokenizer.vocab_size}")
 
     prompt = "introduce yourself"
@@ -276,23 +245,17 @@ if __name__ == "__main__":
     )
     print(f"Prompt: {formatted_prompt}")
 
+    init_gamma = 5
     config = SpeculativeConfig(
-        gamma=5,
+        gamma=init_gamma,
         temperature=0.6,
         top_p=0.9,
         top_k=50,
         do_sample=True,
         max_new_tokens=128,
-        early_stop=False,
+        early_stop=True,
         verbose=False,
     )
-
-    benchmark_results, optimal_gamma = benchmark_decoding(
-        target_model, draft_model, tokenizer, formatted_prompt, config
-    )
-
-    config.gamma = optimal_gamma
-    config.early_stop = True
 
     decoder = SpeculativeDecoder(target_model, draft_model, tokenizer, config)
 
@@ -303,7 +266,7 @@ if __name__ == "__main__":
     print(f"Greedy output: {greedy_output}")
     print(f"Greedy time: {greedy_time:.2f}s")
 
-    print(f"\nRunning speculative decoding (gamma={optimal_gamma})...")
+    print(f"\nRunning speculative decoding (gamma={init_gamma})...")
     start_time = time.time()
     spec_output, metrics = decoder.decode(formatted_prompt)
     spec_time = time.time() - start_time
