@@ -4,7 +4,9 @@ Speculative decoding with KV cache using Hugging Face Transformers. This repo de
 - Greedy decoding with KV cache
 - Speculative decoding with an adaptive gamma strategy
 
-### Quick start
+For a better understanding of Speculative Decoding, check the blog post [Speculative Decoding](https://limei1221.github.io/Speculative-Decoding/).
+
+### Quickstart
 ```bash
 pip install -r requirements.txt
 python speculative_decoding.py
