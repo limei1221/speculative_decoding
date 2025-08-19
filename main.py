@@ -9,15 +9,14 @@ from typing import Tuple, Optional, Dict, Any, List
 @dataclass
 class SpeculativeConfig:
     """Configuration for speculative decoding."""
-    gamma: int = 5  # Number of draft tokens to generate
+    gamma: int = 5
     temperature: float = 0.6
     top_p: float = 0.9
     top_k: int = 50
-    do_sample: bool = True
     max_new_tokens: int = 128
     early_stop: bool = True
     verbose: bool = False
-    max_iterations: int = 100  # Maximum iterations to prevent infinite loops
+    max_iterations: int = 100
 
 
 class SpeculativeDecoder:
@@ -36,106 +35,119 @@ class SpeculativeDecoder:
         self.target_model.eval()
         self.draft_model.eval()
 
-    def _sample_from_logits(self, logits: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Sample tokens from logits using top-k and top-p sampling."""
-        if self.config.do_sample:
-            logits = logits / self.config.temperature
+        # KV cache state for incremental decoding
+        self.target_kv_cache = None
+        self.draft_kv_cache = None
+        self.next_token = None  # shape [1,1]
 
+    def _sample_token_and_prob(self, logits: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Sample a token and return its probability from logits shaped [1, vocab]."""
+        if self.config.temperature > 0.0:
+            scaled = logits / self.config.temperature
             if self.config.top_k > 0:
-                top_k_logits, top_k_indices = torch.topk(logits, self.config.top_k, dim=-1)
-                logits = torch.full_like(logits, float('-inf'))
-                logits.scatter_(-1, top_k_indices, top_k_logits)
-
+                top_k_logits, top_k_indices = torch.topk(scaled, self.config.top_k, dim=-1)
+                filtered = torch.full_like(scaled, float('-inf'))
+                filtered.scatter_(-1, top_k_indices, top_k_logits)
+                scaled = filtered
             if self.config.top_p < 1.0:
-                sorted_logits, sorted_indices = torch.sort(logits, descending=True)
-                cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+                sorted_logits, sorted_indices = torch.sort(scaled, descending=True)
+                sorted_probs = F.softmax(sorted_logits, dim=-1)
+                cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
                 sorted_indices_to_remove = cumulative_probs > self.config.top_p
                 sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
                 sorted_indices_to_remove[..., 0] = 0
                 indices_to_remove = sorted_indices_to_remove.scatter(-1, sorted_indices, sorted_indices_to_remove)
-                logits[indices_to_remove] = float('-inf')
-
-            probs = F.softmax(logits, dim=-1)
-            tokens = torch.multinomial(probs, num_samples=1).squeeze(-1)
+                scaled[indices_to_remove] = float('-inf')
+            probs = F.softmax(scaled, dim=-1)
+            tok = torch.multinomial(probs, num_samples=1)
         else:
-            tokens = torch.argmax(logits, dim=-1)
             probs = F.softmax(logits, dim=-1)
+            tok = torch.argmax(probs, dim=-1, keepdim=True)
+        tok_prob = probs.gather(-1, tok).squeeze(-1)
+        return tok, tok_prob
 
-        return tokens, probs
+    def _generate_draft_tokens(self, gamma: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Generate draft tokens using incremental cached decoding on the draft model.
 
-    def _generate_draft_tokens(self, input_ids: torch.Tensor, attention_mask: torch.Tensor, gamma: int) -> Tuple[
-        torch.Tensor, torch.Tensor]:
-        """Generate draft tokens using the draft model."""
-        with torch.no_grad():
-            draft_outputs = self.draft_model.generate(
-                input_ids,
-                attention_mask=attention_mask,
-                max_new_tokens=gamma,
-                do_sample=self.config.do_sample,
-                temperature=self.config.temperature,
-                pad_token_id=self.tokenizer.eos_token_id,
-                eos_token_id=self.tokenizer.eos_token_id,
-                return_dict_in_generate=True,
-                output_scores=True,
-            )
+        Returns:
+            draft_tokens: [1, gamma]
+            draft_token_probs: [gamma]
+        """
+        tokens: List[int] = []
+        token_probs: List[torch.Tensor] = []
+        local_cache = self.draft_kv_cache
+        local_next = self.next_token
+        with torch.inference_mode():
+            for _ in range(gamma):
+                outputs = self.draft_model(
+                    local_next,
+                    use_cache=True,
+                    past_key_values=local_cache,
+                    return_dict=False,
+                )
+                logits = outputs[0][:, -1, :]
+                tok, tok_prob = self._sample_token_and_prob(logits)
+                tokens.append(tok.item())
+                token_probs.append(tok_prob.squeeze(0))
+                local_cache = outputs[1]
+                local_next = tok
+        draft_tokens = torch.tensor([tokens], device=self.device, dtype=torch.long)
+        draft_token_probs = torch.stack(token_probs, dim=0)
+        return draft_tokens, draft_token_probs
 
-            draft_tokens = draft_outputs.sequences[:, input_ids.size(1):]  # torch.Size([1, 5])
-            if self.config.temperature > 0.0:
-                draft_probs = (torch.stack(draft_outputs.scores) / self.config.temperature).softmax(-1).squeeze(1)
-            else:
-                draft_probs = torch.stack(draft_outputs.scores).softmax(-1).squeeze(1)  # torch.Size([5, 151936])
-
-            return draft_tokens, draft_probs
-
-    def _verify_draft_tokens(self, input_ids: torch.Tensor, attention_mask: torch.Tensor,
-                             draft_tokens: torch.Tensor, draft_probs: torch.Tensor) -> Tuple[torch.Tensor, int]:
-        """Verify draft tokens using the target model with improved acceptance strategy."""
-        with torch.no_grad():
-            extended_input_ids = torch.cat([input_ids, draft_tokens], dim=1)
-            extended_attention_mask = torch.cat([attention_mask, torch.ones_like(draft_tokens)], dim=1)
-
+    def _verify_draft_tokens(self, draft_tokens: torch.Tensor, draft_token_probs: torch.Tensor) -> Tuple[torch.Tensor, int, torch.Tensor]:
+        """Verify draft tokens with a single target forward pass.
+        """
+        accepted_ids: List[int] = []
+        num_accepted = 0
+        with torch.inference_mode():
+            seq = torch.cat([self.next_token, draft_tokens], dim=1)
             outputs = self.target_model(
-                extended_input_ids,
-                attention_mask=extended_attention_mask,
-                return_dict=True,
+                seq,
+                use_cache=True,
+                past_key_values=self.target_kv_cache,
+                return_dict=False,
             )
-
-            target_logits = outputs.logits[:, input_ids.size(1) - 1:, :]  # torch.Size([1, 6, 151936])
-            target_probs = F.softmax(target_logits, dim=-1)
-
-            accepted_tokens = []
-            num_accepted = 0
+            logits_per_pos = outputs[0]  # [1, gamma+1, vocab]
 
             for i in range(draft_tokens.size(1)):
-                draft_token = draft_tokens[0, i]
-                draft_prob = draft_probs[i, draft_token]
-                target_prob = target_probs[0, i, draft_token]
-
-                if target_prob > 0 and draft_prob > 0:
-                    acceptance_prob = min(target_prob / draft_prob, 1.0)
-
-                    if torch.rand(1, device=self.device).item() < acceptance_prob:
-                        accepted_tokens.append(draft_token.item())
+                step_logits = logits_per_pos[:, i, :]
+                draft_tok = draft_tokens[:, i:i+1]
+                draft_prob = draft_token_probs[i]
+                target_probs = F.softmax(step_logits, dim=-1)
+                target_prob = target_probs.gather(-1, draft_tok).squeeze()
+                if self.config.temperature == 0.0:
+                    target_tok = torch.argmax(target_probs, dim=-1).item()
+                    draft_tok = draft_tok.item()
+                    if target_tok == draft_tok:
+                        accepted_ids.append(draft_tok)
                         num_accepted += 1
-                    else:
-                        break
+                        continue
                 else:
-                    break
+                    if target_prob.item() > 0 and draft_prob.item() > 0:
+                        acceptance_prob = min((target_prob / draft_prob).item(), 1.0)
+                        if torch.rand(1, device=self.device).item() < acceptance_prob:
+                            accepted_ids.append(int(draft_tok.item()))
+                            num_accepted += 1
+                            continue
+                break
 
-            next_token_logits = target_logits[0, num_accepted, :]
-            next_token, _ = self._sample_from_logits(next_token_logits.unsqueeze(0))
-            accepted_tokens.append(next_token.item())
+            print('num_accepted: ', num_accepted)
+            next_logits = logits_per_pos[:, num_accepted, :]
+            next_tok, _ = self._sample_token_and_prob(next_logits)
 
-            return torch.tensor([accepted_tokens], device=self.device), num_accepted
+        return torch.tensor([accepted_ids], device=self.device, dtype=torch.long), num_accepted, next_tok
+
 
     def _adaptive_gamma(self, acceptance_ratio: float) -> int:
         """Adaptively adjust gamma based on acceptance ratio."""
-        if acceptance_ratio > 0.8:
-            return min(self.config.gamma + 1, 10)  # Increase gamma if acceptance is high
-        elif acceptance_ratio < 0.3:
-            return max(self.config.gamma - 1, 2)  # Decrease gamma if acceptance is low
-        else:
-            return self.config.gamma  # Keep current gamma
+        # if acceptance_ratio > 0.8:
+        #     return min(self.config.gamma + 1, 10)
+        # elif acceptance_ratio < 0.3:
+        #     return max(self.config.gamma - 1, 2)
+        # else:
+        #     return self.config.gamma
+        return self.config.gamma
 
     def decode(self, prompt: str) -> Tuple[str, Dict[str, Any]]:
         """Main decoding function with speculative decoding and optimizations."""
@@ -150,24 +162,46 @@ class SpeculativeDecoder:
         iterations = 0
         current_gamma = self.config.gamma
 
+        # Prefill both models to initialize KV caches
+        with torch.inference_mode():
+            drf_out = self.draft_model(
+                input_ids,
+                attention_mask=attention_mask,
+                use_cache=True,
+                return_dict=False,
+            )
+            self.draft_kv_cache = drf_out[1]
+
+        with torch.inference_mode():
+            tgt_out = self.target_model(
+                input_ids,
+                attention_mask=attention_mask,
+                use_cache=True,
+                return_dict=False,
+            )
+            self.target_kv_cache = tgt_out[1]
+
+        next_logits = tgt_out[0][:, -1, :]
+        next_tok, _ = self._sample_token_and_prob(next_logits)
+        self.next_token = next_tok
+
         while len(generated_tokens) < self.config.max_new_tokens:
             iterations += 1
 
             if self.config.verbose:
                 print(f"Iteration {iterations}: Current length {len(generated_tokens)}, Gamma: {current_gamma}")
 
-            draft_tokens, draft_probs = self._generate_draft_tokens(input_ids, attention_mask, current_gamma)
+            draft_tokens, draft_token_probs = self._generate_draft_tokens(current_gamma)
 
-            accepted_tokens, num_accepted = self._verify_draft_tokens(
-                input_ids, attention_mask, draft_tokens, draft_probs
-            )
+            accepted_tokens, num_accepted, next_tok = self._verify_draft_tokens(draft_tokens, draft_token_probs)
 
             total_proposed += draft_tokens.size(1)
             total_accepted += num_accepted
 
-            for token in accepted_tokens[0]:
-                generated_tokens.append(token)
-                if token == self.tokenizer.eos_token_id and self.config.early_stop:
+            tokens_to_commit = torch.concat([self.next_token, accepted_tokens], dim=1)
+            for token_id in tokens_to_commit[0].tolist():
+                generated_tokens.append(token_id)
+                if token_id == self.tokenizer.eos_token_id and self.config.early_stop:
                     break
 
             if (self.tokenizer.eos_token_id in generated_tokens and self.config.early_stop) or len(
@@ -178,8 +212,26 @@ class SpeculativeDecoder:
                 print("Warning: Maximum iterations reached")
                 break
 
-            input_ids = torch.cat([input_ids, accepted_tokens], dim=1)
-            attention_mask = torch.cat([attention_mask, torch.ones_like(accepted_tokens)], dim=1)
+            # Update kv_cache for draft model
+            with torch.inference_mode():
+                outputs = self.draft_model(
+                    tokens_to_commit,
+                    use_cache=True,
+                    past_key_values=self.draft_kv_cache,
+                    return_dict=False,
+                )
+                self.draft_kv_cache = outputs[1]
+            # Update kv_cache for target model
+            with torch.inference_mode():
+                outputs = self.target_model(
+                    tokens_to_commit,
+                    use_cache=True,
+                    past_key_values=self.target_kv_cache,
+                    return_dict=False,
+                )
+                self.target_kv_cache = outputs[1]
+
+            self.next_token = next_tok
 
             if iterations > 1:
                 acceptance_ratio = total_accepted / total_proposed
@@ -207,7 +259,7 @@ def greedy_decode(model, tokenizer, prompt: str, max_new_tokens: int = 128) -> s
 
     inputs = tokenizer(prompt, return_tensors="pt").to(device)
 
-    with torch.no_grad():
+    with torch.inference_mode():
         outputs = model.generate(
             inputs.input_ids,
             attention_mask=inputs.attention_mask,
@@ -225,10 +277,26 @@ def greedy_decode(model, tokenizer, prompt: str, max_new_tokens: int = 128) -> s
 if __name__ == "__main__":
     print("Loading models...")
     model_name = "Qwen/Qwen3-1.7B"
-    draft_model_name = "Qwen/Qwen3-0.6B"
+    draft_model_name = "Qwen/Qwen3-1.7B"
 
-    target_model = AutoModelForCausalLM.from_pretrained(model_name)
-    draft_model = AutoModelForCausalLM.from_pretrained(draft_model_name)
+    def load_model(name: str):
+        return AutoModelForCausalLM.from_pretrained(name)
+        # if torch.cuda.is_available():
+        #     try:
+        #         return AutoModelForCausalLM.from_pretrained(name, attn_implementation="flash_attention_2")
+        #     except Exception:
+        #         try:
+        #             return AutoModelForCausalLM.from_pretrained(name, attn_implementation="sdpa")
+        #         except Exception:
+        #             return AutoModelForCausalLM.from_pretrained(name)
+        # else:
+        #     try:
+        #         return AutoModelForCausalLM.from_pretrained(name, attn_implementation="sdpa")
+        #     except Exception:
+        #         return AutoModelForCausalLM.from_pretrained(name)
+
+    target_model = load_model(model_name)
+    draft_model = load_model(draft_model_name)
 
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     draft_tokenizer = AutoTokenizer.from_pretrained(draft_model_name)
@@ -248,14 +316,24 @@ if __name__ == "__main__":
     init_gamma = 5
     config = SpeculativeConfig(
         gamma=init_gamma,
-        temperature=0.6,
+        temperature=0.0,
         top_p=0.9,
         top_k=50,
-        do_sample=True,
         max_new_tokens=128,
         early_stop=True,
         verbose=False,
     )
+
+    # # Optionally compile for speed (CUDA recommended)
+    # def maybe_compile(model):
+    #     try:
+    #         return torch.compile(model, mode="max-autotune")
+    #     except Exception:
+    #         return model
+
+    # if torch.cuda.is_available():
+    #     target_model = maybe_compile(target_model)
+    #     draft_model = maybe_compile(draft_model)
 
     decoder = SpeculativeDecoder(target_model, draft_model, tokenizer, config)
 
