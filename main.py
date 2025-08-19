@@ -132,22 +132,20 @@ class SpeculativeDecoder:
                             continue
                 break
 
-            print('num_accepted: ', num_accepted)
             next_logits = logits_per_pos[:, num_accepted, :]
-            next_tok, _ = self._sample_token_and_prob(next_logits)
+            next_token, _ = self._sample_token_and_prob(next_logits)
 
-        return torch.tensor([accepted_ids], device=self.device, dtype=torch.long), num_accepted, next_tok
+        return torch.tensor([accepted_ids], device=self.device, dtype=torch.long), num_accepted, next_token
 
 
     def _adaptive_gamma(self, acceptance_ratio: float) -> int:
         """Adaptively adjust gamma based on acceptance ratio."""
-        # if acceptance_ratio > 0.8:
-        #     return min(self.config.gamma + 1, 10)
-        # elif acceptance_ratio < 0.3:
-        #     return max(self.config.gamma - 1, 2)
-        # else:
-        #     return self.config.gamma
-        return self.config.gamma
+        if acceptance_ratio > 0.8:
+            return min(self.config.gamma + 1, 10)
+        elif acceptance_ratio < 0.3:
+            return max(self.config.gamma - 1, 2)
+        else:
+            return self.config.gamma
 
     def decode(self, prompt: str) -> Tuple[str, Dict[str, Any]]:
         """Main decoding function with speculative decoding and optimizations."""
@@ -181,9 +179,8 @@ class SpeculativeDecoder:
             )
             self.target_kv_cache = tgt_out[1]
 
-        next_logits = tgt_out[0][:, -1, :]
-        next_tok, _ = self._sample_token_and_prob(next_logits)
-        self.next_token = next_tok
+        next_token, _ = self._sample_token_and_prob(tgt_out[0][:, -1, :])
+        self.next_token = next_token
 
         while len(generated_tokens) < self.config.max_new_tokens:
             iterations += 1
@@ -193,12 +190,12 @@ class SpeculativeDecoder:
 
             draft_tokens, draft_token_probs = self._generate_draft_tokens(current_gamma)
 
-            accepted_tokens, num_accepted, next_tok = self._verify_draft_tokens(draft_tokens, draft_token_probs)
+            accepted_tokens, num_accepted, next_token = self._verify_draft_tokens(draft_tokens, draft_token_probs)
 
             total_proposed += draft_tokens.size(1)
             total_accepted += num_accepted
 
-            tokens_to_commit = torch.concat([self.next_token, accepted_tokens], dim=1)
+            tokens_to_commit = torch.concat([self.next_token, accepted_tokens, next_token], dim=1)
             for token_id in tokens_to_commit[0].tolist():
                 generated_tokens.append(token_id)
                 if token_id == self.tokenizer.eos_token_id and self.config.early_stop:
@@ -214,24 +211,26 @@ class SpeculativeDecoder:
 
             # Update kv_cache for draft model
             with torch.inference_mode():
-                outputs = self.draft_model(
+                draft_outputs = self.draft_model(
                     tokens_to_commit,
                     use_cache=True,
                     past_key_values=self.draft_kv_cache,
                     return_dict=False,
                 )
-                self.draft_kv_cache = outputs[1]
+                self.draft_kv_cache = draft_outputs[1]
+
             # Update kv_cache for target model
             with torch.inference_mode():
-                outputs = self.target_model(
+                target_outputs = self.target_model(
                     tokens_to_commit,
                     use_cache=True,
                     past_key_values=self.target_kv_cache,
                     return_dict=False,
                 )
-                self.target_kv_cache = outputs[1]
+                self.target_kv_cache = target_outputs[1]
 
-            self.next_token = next_tok
+            next_token, _ = self._sample_token_and_prob(target_outputs[0][:, -1, :])
+            self.next_token = next_token
 
             if iterations > 1:
                 acceptance_ratio = total_accepted / total_proposed
@@ -274,26 +273,66 @@ def greedy_decode(model, tokenizer, prompt: str, max_new_tokens: int = 128) -> s
     return completion
 
 
+def cache_decode(model, tokenizer, prompt: str, max_new_tokens: int = 128) -> str:
+    """Simple greedy decoding for comparison."""
+    device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
+    model.eval()
+
+    inputs = tokenizer(prompt, return_tensors="pt").to(device)
+
+    kv_cache = None
+
+    generated_tokens = []
+    with torch.inference_mode():
+        # prefill
+        model_output = model(
+            inputs.input_ids,
+            attention_mask=inputs.attention_mask,
+            use_cache=True,
+            return_dict=False,
+        )
+        kv_cache = model_output[1]
+        next_token = torch.argmax(model_output[0][:, -1, :], dim=-1)
+
+        generated_tokens.append(next_token.item())
+        while len(generated_tokens) < max_new_tokens:
+            # deocde
+            model_output = model(
+                next_token.view(1, 1),
+                use_cache=True,
+                past_key_values=kv_cache,
+                return_dict=False,
+            )
+            kv_cache = model_output[1]
+            next_token = torch.argmax(model_output[0][:, -1, :], dim=-1)
+            generated_tokens.append(next_token.item())
+
+            if tokenizer.eos_token_id in generated_tokens:
+                break
+
+    completion = tokenizer.decode(generated_tokens, skip_special_tokens=True)
+    return completion
+
+
 if __name__ == "__main__":
     print("Loading models...")
     model_name = "Qwen/Qwen3-1.7B"
-    draft_model_name = "Qwen/Qwen3-1.7B"
+    draft_model_name = "Qwen/Qwen3-0.6B"
 
     def load_model(name: str):
-        return AutoModelForCausalLM.from_pretrained(name)
-        # if torch.cuda.is_available():
-        #     try:
-        #         return AutoModelForCausalLM.from_pretrained(name, attn_implementation="flash_attention_2")
-        #     except Exception:
-        #         try:
-        #             return AutoModelForCausalLM.from_pretrained(name, attn_implementation="sdpa")
-        #         except Exception:
-        #             return AutoModelForCausalLM.from_pretrained(name)
-        # else:
-        #     try:
-        #         return AutoModelForCausalLM.from_pretrained(name, attn_implementation="sdpa")
-        #     except Exception:
-        #         return AutoModelForCausalLM.from_pretrained(name)
+        if torch.cuda.is_available():
+            try:
+                return AutoModelForCausalLM.from_pretrained(name, attn_implementation="flash_attention_2")
+            except Exception:
+                try:
+                    return AutoModelForCausalLM.from_pretrained(name, attn_implementation="sdpa")
+                except Exception:
+                    return AutoModelForCausalLM.from_pretrained(name)
+        else:
+            try:
+                return AutoModelForCausalLM.from_pretrained(name, attn_implementation="sdpa")
+            except Exception:
+                return AutoModelForCausalLM.from_pretrained(name)
 
     target_model = load_model(model_name)
     draft_model = load_model(draft_model_name)
@@ -324,16 +363,16 @@ if __name__ == "__main__":
         verbose=False,
     )
 
-    # # Optionally compile for speed (CUDA recommended)
-    # def maybe_compile(model):
-    #     try:
-    #         return torch.compile(model, mode="max-autotune")
-    #     except Exception:
-    #         return model
+    # Optionally compile for speed (CUDA recommended)
+    def maybe_compile(model):
+        try:
+            return torch.compile(model, mode="max-autotune")
+        except Exception:
+            return model
 
-    # if torch.cuda.is_available():
-    #     target_model = maybe_compile(target_model)
-    #     draft_model = maybe_compile(draft_model)
+    if torch.cuda.is_available():
+        target_model = maybe_compile(target_model)
+        draft_model = maybe_compile(draft_model)
 
     decoder = SpeculativeDecoder(target_model, draft_model, tokenizer, config)
 
@@ -342,13 +381,20 @@ if __name__ == "__main__":
     greedy_output = greedy_decode(target_model, tokenizer, formatted_prompt, max_new_tokens=128)
     greedy_time = time.time() - start_time
     print(f"Greedy output: {greedy_output}")
-    print(f"Greedy time: {greedy_time:.2f}s")
+    print(f"Greedy decoding time: {greedy_time:.2f}s")
+
+    print("Running greedy decoding with kv cache...")
+    start_time = time.time()
+    cache_output = cache_decode(target_model, tokenizer, formatted_prompt, max_new_tokens=128)
+    cache_time = time.time() - start_time
+    print(f"Cache output: {cache_output}")
+    print(f"Cache decoding time: {cache_time:.2f}s")
 
     print(f"\nRunning speculative decoding (gamma={init_gamma})...")
     start_time = time.time()
     spec_output, metrics = decoder.decode(formatted_prompt)
     spec_time = time.time() - start_time
     print(f"Speculative output: {spec_output}")
-    print(f"Speculative time: {spec_time:.2f}s")
+    print(f"Speculative decoding time: {spec_time:.2f}s")
     print(f"Speedup: {greedy_time / spec_time:.2f}x")
     print(f"Metrics: {metrics}")
