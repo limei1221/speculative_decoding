@@ -2,8 +2,15 @@ import time
 import torch
 import torch.nn.functional as F
 from dataclasses import dataclass
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoTokenizer, AutoModelForCausalLM, DynamicCache
 from typing import Tuple, Optional, Dict, Any, List
+
+def truncate_kv(cache, keep_len):
+    truncated = []
+    for layer_k, layer_v in cache:
+        # works for common HF shapes (batch, num_heads, seq_len, head_dim)
+        truncated.append((layer_k[..., :keep_len, :], layer_v[..., :keep_len, :]))
+    return DynamicCache.from_legacy_cache(truncated)
 
 
 @dataclass
@@ -75,21 +82,20 @@ class SpeculativeDecoder:
         """
         tokens: List[int] = []
         token_probs: List[torch.Tensor] = []
-        local_cache = self.draft_kv_cache
         local_next = self.next_token
         with torch.inference_mode():
             for _ in range(gamma):
                 outputs = self.draft_model(
                     local_next,
                     use_cache=True,
-                    past_key_values=local_cache,
+                    past_key_values=self.draft_kv_cache,
                     return_dict=False,
                 )
                 logits = outputs[0][:, -1, :]
                 tok, tok_prob = self._sample_token_and_prob(logits)
                 tokens.append(tok.item())
                 token_probs.append(tok_prob.squeeze(0))
-                local_cache = outputs[1]
+                self.draft_kv_cache = outputs[1]
                 local_next = tok
         draft_tokens = torch.tensor([tokens], device=self.device, dtype=torch.long)
         draft_token_probs = torch.stack(token_probs, dim=0)
@@ -178,6 +184,7 @@ class SpeculativeDecoder:
                 return_dict=False,
             )
             self.target_kv_cache = tgt_out[1]
+            keep_len = self.target_kv_cache.get_seq_length()
 
         next_token, _ = self._sample_token_and_prob(tgt_out[0][:, -1, :])
         self.next_token = next_token
@@ -195,7 +202,13 @@ class SpeculativeDecoder:
             total_proposed += draft_tokens.size(1)
             total_accepted += num_accepted
 
-            tokens_to_commit = torch.concat([self.next_token, accepted_tokens, next_token], dim=1)
+            tokens_to_commit = torch.concat([self.next_token, accepted_tokens], dim=1)
+
+            # Update KV caches properly for DynamicCache objects
+            keep_len += 1 + num_accepted
+            self.draft_kv_cache = truncate_kv(self.draft_kv_cache, keep_len)
+            self.target_kv_cache = truncate_kv(self.target_kv_cache, keep_len)
+
             for token_id in tokens_to_commit[0].tolist():
                 generated_tokens.append(token_id)
                 if token_id == self.tokenizer.eos_token_id and self.config.early_stop:
@@ -209,27 +222,6 @@ class SpeculativeDecoder:
                 print("Warning: Maximum iterations reached")
                 break
 
-            # Update kv_cache for draft model
-            with torch.inference_mode():
-                draft_outputs = self.draft_model(
-                    tokens_to_commit,
-                    use_cache=True,
-                    past_key_values=self.draft_kv_cache,
-                    return_dict=False,
-                )
-                self.draft_kv_cache = draft_outputs[1]
-
-            # Update kv_cache for target model
-            with torch.inference_mode():
-                target_outputs = self.target_model(
-                    tokens_to_commit,
-                    use_cache=True,
-                    past_key_values=self.target_kv_cache,
-                    return_dict=False,
-                )
-                self.target_kv_cache = target_outputs[1]
-
-            next_token, _ = self._sample_token_and_prob(target_outputs[0][:, -1, :])
             self.next_token = next_token
 
             if iterations > 1:
@@ -396,5 +388,6 @@ if __name__ == "__main__":
     spec_time = time.time() - start_time
     print(f"Speculative output: {spec_output}")
     print(f"Speculative decoding time: {spec_time:.2f}s")
-    print(f"Speedup: {greedy_time / spec_time:.2f}x")
+    print(f"Speedup over greedy decoding: {greedy_time / spec_time:.2f}x")
+    print(f"Speedup over greedy decoding with kv cache: {cache_time / spec_time:.2f}x")
     print(f"Metrics: {metrics}")
