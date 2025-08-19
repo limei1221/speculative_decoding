@@ -229,6 +229,8 @@ class SpeculativeDecoder:
             self.draft_kv_cache = truncate_kv(self.draft_kv_cache, keep_len)
             self.target_kv_cache = truncate_kv(self.target_kv_cache, keep_len)
 
+            self.next_token = next_token
+
             for token_id in tokens_to_commit[0].tolist():
                 generated_tokens.append(token_id)
                 if token_id == self.tokenizer.eos_token_id and self.config.early_stop:
@@ -243,8 +245,6 @@ class SpeculativeDecoder:
             if iterations > self.config.max_iterations:
                 print("Warning: Maximum iterations reached")
                 break
-
-            self.next_token = next_token
 
             if iterations > 1:
                 acceptance_ratio = total_accepted / total_proposed
@@ -293,7 +293,7 @@ def greedy_decode(model, tokenizer, prompt: str, max_new_tokens: int = 128) -> s
     return completion
 
 
-def cache_decode(model, tokenizer, prompt: str, max_new_tokens: int = 128) -> str:
+def greedy_decode_with_cache(model, tokenizer, prompt: str, max_new_tokens: int = 128) -> str:
     """Simple greedy decoding for comparison."""
     device = (
         "cuda"
@@ -417,7 +417,7 @@ if __name__ == "__main__":
 
     print("Running greedy decoding with kv cache...")
     start_time = time.time()
-    cache_output = cache_decode(
+    cache_output = greedy_decode_with_cache(
         target_model, tokenizer, formatted_prompt, max_new_tokens=128
     )
     cache_time = time.time() - start_time
