@@ -3,6 +3,7 @@ Speculative decoding with KV cache using Hugging Face Transformers. This repo de
 - Greedy decoding
 - Greedy decoding with KV cache
 - Speculative decoding with KV cache
+
 For a better understanding of Speculative Decoding, check the blog post [Speculative Decoding](https://limei1221.github.io/Speculative-Decoding/).
 
 ### Quickstart
