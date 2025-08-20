@@ -7,12 +7,10 @@ from typing import Tuple, Optional, Dict, Any, List
 
 
 def truncate_kv(cache, keep_len):
-    truncated = []
-    for layer_k, layer_v in cache:
-        # works for common HF shapes (batch, num_heads, seq_len, head_dim)
-        truncated.append((layer_k[..., :keep_len, :], layer_v[..., :keep_len, :]))
-    return DynamicCache.from_legacy_cache(truncated)
-
+    assert isinstance(cache, DynamicCache)
+    for idx in range(len(cache.layers)):
+        cache.layers[idx].keys = cache.layers[idx].keys[..., :keep_len, :]
+        cache.layers[idx].values = cache.layers[idx].values[..., :keep_len, :]
 
 @dataclass
 class SpeculativeConfig:
@@ -95,12 +93,11 @@ class SpeculativeDecoder:
                     use_cache=True,
                     past_key_values=self.draft_kv_cache,
                     return_dict=False,
-                )
+                )  # self.draft_kv_cache updated automatically
                 logits = outputs[0][:, -1, :]
                 tok, tok_prob = self._sample_token_and_prob(logits)
                 tokens.append(tok.item())
                 token_probs.append(tok_prob)
-                self.draft_kv_cache = outputs[1]
                 local_next = tok
         draft_tokens = torch.tensor([tokens], device=self.device, dtype=torch.long)
         draft_token_probs = torch.stack(token_probs, dim=0).transpose(0, 1)
@@ -119,7 +116,7 @@ class SpeculativeDecoder:
                 use_cache=True,
                 past_key_values=self.target_kv_cache,
                 return_dict=False,
-            )
+            )  # self.target_kv_cache updated automatically
             target_token_logits = outputs[0]  # [1, gamma+1, vocab_size]
             target_token_probs = self._logits_to_probs(target_token_logits)  # [1, gamma+1, vocab_size]
 
@@ -165,15 +162,6 @@ class SpeculativeDecoder:
             next_token,
         )
 
-    def _adaptive_gamma(self, acceptance_ratio: float) -> int:
-        """Adaptively adjust gamma based on acceptance ratio."""
-        if acceptance_ratio > 0.8:
-            return min(self.config.gamma + 1, 10)
-        elif acceptance_ratio < 0.3:
-            return max(self.config.gamma - 1, 2)
-        else:
-            return self.config.gamma
-
     def decode(self, prompt: str) -> Tuple[str, Dict[str, Any]]:
         """Main decoding function with speculative decoding and optimizations."""
         inputs = self.tokenizer(prompt, return_tensors="pt").to(self.device)
@@ -210,7 +198,6 @@ class SpeculativeDecoder:
         total_proposed = 0
         total_accepted = 0
         current_gamma = self.config.gamma
-        iterations = 0
         while len(generated_tokens) < self.config.max_new_tokens:
             draft_tokens, draft_token_probs = self._generate_draft_tokens(current_gamma)
 
@@ -223,8 +210,18 @@ class SpeculativeDecoder:
 
             # update KV caches
             keep_len += 1 + num_accepted  # [self.next_token, accepted_tokens]
-            self.draft_kv_cache = truncate_kv(self.draft_kv_cache, keep_len)
-            self.target_kv_cache = truncate_kv(self.target_kv_cache, keep_len)
+            if num_accepted == draft_tokens.size(1):
+                # last token is accepted, so we need to update self.draft_kv_cache with the last token
+                with torch.inference_mode():
+                    outputs = self.draft_model(
+                        accepted_tokens[:, -1:],
+                        use_cache=True,
+                        past_key_values=self.draft_kv_cache,
+                        return_dict=False,
+                    )
+            else:
+                truncate_kv(self.draft_kv_cache, keep_len)
+            truncate_kv(self.target_kv_cache, keep_len)
 
             for token_id in accepted_tokens[0].tolist():
                 generated_tokens.append(token_id)
@@ -236,11 +233,6 @@ class SpeculativeDecoder:
                 eos_idx = generated_tokens.index(self.tokenizer.eos_token_id)
                 generated_tokens = generated_tokens[:eos_idx]
                 break
-
-            iterations += 1
-            if iterations > 1:
-                acceptance_ratio = total_accepted / total_proposed
-                current_gamma = self._adaptive_gamma(acceptance_ratio)
 
         completion = self.tokenizer.decode(generated_tokens, skip_special_tokens=True)
 
@@ -303,8 +295,7 @@ def greedy_decode_with_cache(model, tokenizer, prompt: str, max_new_tokens: int 
                 use_cache=True,
                 past_key_values=kv_cache,
                 return_dict=False,
-            )
-            kv_cache = model_output[1]
+            )  # kv_cache updated automatically
             next_token = torch.argmax(model_output[0][:, -1, :], dim=-1)
             generated_tokens.append(next_token.item())
 
@@ -345,7 +336,7 @@ if __name__ == "__main__":
     init_gamma = 5
     config = SpeculativeConfig(
         gamma=init_gamma,
-        temperature=1.0,  # temperature=0.0: deterministic, 0.0<temperature<1.0: more sharpness, temperature>1.0: more randomness
+        temperature=0.0,  # temperature=0.0: deterministic, 0.0<temperature<1.0: more sharpness, temperature>1.0: more randomness
         top_p=1,
         top_k=0,
         max_new_tokens=128,
@@ -382,7 +373,7 @@ if __name__ == "__main__":
     print(f"Speculative output: {spec_output!r}")
     print(f"Speculative decoding time: {spec_time:.2f}s")
     print(f"Speculative throughput: {metrics['generated_length'] / spec_time:.2f} tokens/s")
+    print(f"Speculative Metrics: {metrics}")
 
     print(f"Speedup over greedy decoding: {greedy_time / spec_time:.2f}x")
     print(f"Speedup over greedy decoding with kv cache: {cache_time / spec_time:.2f}x")
-    print(f"Metrics: {metrics}")
