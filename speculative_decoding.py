@@ -76,7 +76,7 @@ class SpeculativeDecoder:
             tok = torch.argmax(probs, dim=-1, keepdim=True)  # [1, 1]
         return tok, probs
 
-    def _generate_draft_tokens(self, gamma: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _generate_draft_tokens(self) -> Tuple[torch.Tensor, torch.Tensor]:
         """Generate draft tokens using incremental cached decoding on the draft model.
 
         Returns:
@@ -85,11 +85,11 @@ class SpeculativeDecoder:
         """
         tokens: List[int] = []
         token_probs: List[torch.Tensor] = []
-        local_next = self.next_token
+        tok = self.next_token
         with torch.inference_mode():
-            for _ in range(gamma):
+            for _ in range(self.config.gamma):
                 outputs = self.draft_model(
-                    local_next,
+                    tok,
                     use_cache=True,
                     past_key_values=self.draft_kv_cache,
                     return_dict=False,
@@ -98,7 +98,6 @@ class SpeculativeDecoder:
                 tok, tok_prob = self._sample_token_and_prob(logits)
                 tokens.append(tok.item())
                 token_probs.append(tok_prob)
-                local_next = tok
         draft_tokens = torch.tensor([tokens], device=self.device, dtype=torch.long)
         draft_token_probs = torch.stack(token_probs, dim=0).transpose(0, 1)
         return draft_tokens, draft_token_probs
@@ -120,7 +119,7 @@ class SpeculativeDecoder:
             target_token_logits = outputs[0]  # [1, gamma+1, vocab_size]
             target_token_probs = self._logits_to_probs(target_token_logits)  # [1, gamma+1, vocab_size]
 
-            for i in range(draft_tokens.size(1)):
+            for i in range(self.config.gamma):
                 draft_tok = draft_tokens[:, i : i + 1]  # [1, 1]
                 cur_draft_probs = draft_token_probs[:, i, :]  # [1, vocab_size]
                 draft_prob = cur_draft_probs.gather(-1, draft_tok).squeeze()
@@ -128,21 +127,20 @@ class SpeculativeDecoder:
                 cur_target_probs = target_token_probs[:, i, :]  # [1, vocab_size]
                 target_prob = cur_target_probs.gather(-1, draft_tok).squeeze()
                 if self.config.temperature == 0.0:
-                    target_tok = torch.argmax(cur_target_probs, dim=-1).item()
-                    draft_tok = draft_tok.item()
-                    if target_tok == draft_tok:
-                        accepted_ids.append(draft_tok)
+                    target_tok = torch.argmax(cur_target_probs, dim=-1)
+                    if target_tok.item() == draft_tok.item():
+                        accepted_ids.append(draft_tok.item())
                         num_accepted += 1
                         continue
                 else:
                     acceptance_prob = min((target_prob / draft_prob).item(), 1.0)
                     if torch.rand(1, device=self.device).item() < acceptance_prob:
-                        accepted_ids.append(draft_tok)
+                        accepted_ids.append(draft_tok.item())
                         num_accepted += 1
                         continue
                 break
 
-            if num_accepted < draft_tokens.size(1):
+            if num_accepted < self.config.gamma:
                 adjusted_probs = torch.clamp(
                     target_token_probs[:, num_accepted, :] - draft_token_probs[:, num_accepted, :],
                     min=0,
@@ -187,7 +185,7 @@ class SpeculativeDecoder:
                 return_dict=False,
             )
             self.target_kv_cache = tgt_out[1]
-            keep_len = self.target_kv_cache.get_seq_length()
+        keep_len = input_ids.size(1)
 
         next_logits = tgt_out[0][:, -1, :]
         next_token, _ = self._sample_token_and_prob(next_logits)
@@ -197,20 +195,19 @@ class SpeculativeDecoder:
         # speculative decoding
         total_proposed = 0
         total_accepted = 0
-        current_gamma = self.config.gamma
-        while len(generated_tokens) < self.config.max_new_tokens:
-            draft_tokens, draft_token_probs = self._generate_draft_tokens(current_gamma)
+        while keep_len + 1 < self.config.max_new_tokens:
+            draft_tokens, draft_token_probs = self._generate_draft_tokens()
 
             accepted_tokens, num_accepted, next_token = self._verify_draft_tokens(
                 draft_tokens, draft_token_probs
             )
 
-            total_proposed += draft_tokens.size(1)
+            total_proposed += self.config.gamma
             total_accepted += num_accepted
 
             # update KV caches
             keep_len += 1 + num_accepted  # [self.next_token, accepted_tokens]
-            if num_accepted == draft_tokens.size(1):
+            if num_accepted == self.config.gamma:
                 # last token is accepted, so we need to update self.draft_kv_cache with the last token
                 with torch.inference_mode():
                     outputs = self.draft_model(
@@ -242,7 +239,6 @@ class SpeculativeDecoder:
             "acceptance_ratio": (
                 total_accepted / total_proposed if total_proposed > 0 else 0
             ),
-            "final_gamma": current_gamma,
             "generated_length": len(generated_tokens),
         }
 
