@@ -309,7 +309,7 @@ def greedy_decode_with_cache(model, tokenizer, prompt: str, max_new_tokens: int 
 
 if __name__ == "__main__":
     print("Loading models...")
-    model_name = "Qwen/Qwen3-4B"  # recommend 100x larger than draft model from paper
+    model_name = "Qwen/Qwen3-4B"  # recommend 100x larger than draft model from the paper
     draft_model_name = "Qwen/Qwen3-0.6B"
     device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
 
@@ -333,9 +333,8 @@ if __name__ == "__main__":
     )
     print(f"Prompt: {formatted_prompt}")
 
-    init_gamma = 5
     config = SpeculativeConfig(
-        gamma=init_gamma,
+        gamma=3,  # number of draft tokens to generate each iteration
         temperature=0.0,  # temperature=0.0: deterministic, 0.0<temperature<1.0: more sharpness, temperature>1.0: more randomness
         top_p=1,
         top_k=0,
@@ -366,7 +365,7 @@ if __name__ == "__main__":
     print(f"Cache decoding time: {cache_time:.2f}s")
     print(f"Cache throughput: {cache_num_tokens / cache_time:.2f} tokens/s")
 
-    print(f"\nRunning speculative decoding (gamma={init_gamma})...")
+    print(f"\nRunning speculative decoding (gamma={config.gamma})...")
     start_time = time.time()
     spec_output, metrics = decoder.decode(formatted_prompt)
     spec_time = time.time() - start_time
