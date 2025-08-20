@@ -220,8 +220,7 @@ class SpeculativeDecoder:
                 truncate_kv(self.draft_kv_cache, keep_len)
             truncate_kv(self.target_kv_cache, keep_len)
 
-            for token_id in accepted_tokens[0].tolist():
-                generated_tokens.append(token_id)
+            generated_tokens.extend(accepted_tokens[0].tolist())
 
             self.next_token = next_token
             generated_tokens.append(self.next_token.item())
@@ -248,6 +247,7 @@ class SpeculativeDecoder:
 def greedy_decode(model, tokenizer, prompt: str, max_new_tokens: int = 128, device: str = "cuda") -> str:
     """Simple greedy decoding for comparison."""
     inputs = tokenizer(prompt, return_tensors="pt").to(device)
+    input_len = inputs.input_ids.size(1)
 
     with torch.inference_mode():
         outputs = model.generate(
@@ -259,7 +259,6 @@ def greedy_decode(model, tokenizer, prompt: str, max_new_tokens: int = 128, devi
             eos_token_id=tokenizer.eos_token_id,
         )
 
-    input_len = inputs.input_ids.size(1)
     completion = tokenizer.decode(outputs[0][input_len:], skip_special_tokens=True)
     num_generated_tokens = len(outputs[0][input_len:])
     return completion, num_generated_tokens
